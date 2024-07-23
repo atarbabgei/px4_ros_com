@@ -7,6 +7,7 @@ from sensor_msgs.msg import Joy
 from px4_msgs.msg import OffboardControlMode, VehicleAttitudeSetpoint, VehicleCommand, VehicleLocalPosition, VehicleStatus
 import numpy as np
 import math
+import time
 
 class OffboardControl(Node):
     """Node for controlling a vehicle in offboard mode."""
@@ -44,6 +45,17 @@ class OffboardControl(Node):
         self.joy_axes = [0.0, 0.0, 0.0, 0.0]  # Initialize joystick axes
         self.joy_buttons = [0] * 12  # Initialize joystick buttons, assuming 12 buttons
         self.current_yaw = 0.0  # Initialize the current yaw angle
+        self.desired_altitude = 0.0  # Initialize the desired altitude to 0 meters
+
+        # PID controller variables
+        self.altitude_error_previous = 0.0
+        self.altitude_error_integral = 0.0
+        self.altitude_control_time = self.get_clock().now().nanoseconds
+
+        # PID gains
+        self.Kp = 0.1
+        self.Ki = 0.01
+        self.Kd = 0.05
 
         # Create a timer to publish control commands
         self.timer = self.create_timer(0.1, self.timer_callback)
@@ -120,7 +132,7 @@ class OffboardControl(Node):
         msg.reset_integral = False
         msg.fw_control_yaw_wheel = False
         self.attitude_setpoint_publisher.publish(msg)
-        self.get_logger().info(f"Publishing attitude setpoint: roll={roll}, pitch={pitch}, yaw={yaw}, thrust={thrust}")
+        #self.get_logger().info(f"Publishing attitude setpoint: roll={roll}, pitch={pitch}, yaw={yaw}, thrust={thrust}")
 
     def publish_vehicle_command(self, command, **params) -> None:
         """Publish a vehicle command."""
@@ -158,19 +170,59 @@ class OffboardControl(Node):
 
         if self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD:
             # Get joystick inputs
-            thrust = - (self.joy_axes[0] - 1) / 2  # Assuming axis 0 for thrust and normalizing to [0, 1]
-            roll = - self.joy_axes[1]  # Assuming axis 1 for roll
-            pitch = self.joy_axes[2]  # Assuming axis 2 for pitch
-            yaw_rate = - self.joy_axes[3]  # Assuming axis 3 for yaw rate
+            roll = - self.joy_axes[1]  # Assuming axis 0 for roll
+            pitch = self.joy_axes[2]  # Assuming axis 1 for pitch
+            yaw_rate = - self.joy_axes[3]  # Assuming axis 2 for yaw rate
+
+
+            # Throttle control for altitude
+            throttle = - self.joy_axes[0]  # Assuming axis 1 for throttle
+
+            # Update desired altitude based on throttle input
+            if throttle > 0.1:
+                self.desired_altitude += throttle * 0.1  # Adjust scaling factor as needed
+            elif throttle < -0.1:
+                self.desired_altitude += throttle * 0.1  # Adjust scaling factor as needed
+
+            # Ensure desired altitude is non-negative
+            self.desired_altitude = max(self.desired_altitude, 0.0)
 
             # Update the current yaw angle based on yaw rate
             self.current_yaw += yaw_rate 
+
+            # Altitude control
+            current_altitude = - self.vehicle_local_position.z
+            altitude_error = self.desired_altitude - current_altitude
+            thrust = self.calculate_thrust(altitude_error)
 
             # Send attitude setpoint based on joystick input
             self.publish_attitude_setpoint(roll, pitch, self.current_yaw, thrust)
 
         if self.offboard_setpoint_counter < 11:
             self.offboard_setpoint_counter += 1
+
+    def calculate_thrust(self, altitude_error):
+        """PID controller to calculate thrust based on altitude error."""
+        current_time = self.get_clock().now().nanoseconds
+        dt = (current_time - self.altitude_control_time) / 1e9  # Convert to seconds
+        self.altitude_control_time = current_time
+
+        # Proportional term
+        P = self.Kp * altitude_error
+
+        # Integral term
+        self.altitude_error_integral += altitude_error * dt
+        I = self.Ki * self.altitude_error_integral
+
+        # Derivative term
+        D = self.Kd * (altitude_error - self.altitude_error_previous) / dt
+        self.altitude_error_previous = altitude_error
+
+        # Calculate total thrust
+        thrust = P + I + D
+        thrust = np.clip(thrust, 0.0, 1.0)  # Ensure thrust is within valid range [0, 1]
+        #self.get_logger().info(f"Calculated thrust: {thrust}, altitude error: {altitude_error}")
+        return thrust
 
 def main(args=None) -> None:
     print('Starting offboard control node...')
