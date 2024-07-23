@@ -2,9 +2,11 @@
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleStatus
-
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from sensor_msgs.msg import Joy
+from px4_msgs.msg import OffboardControlMode, VehicleAttitudeSetpoint, VehicleCommand, VehicleLocalPosition, VehicleStatus
+import numpy as np
+import math
 
 class OffboardControl(Node):
     """Node for controlling a vehicle in offboard mode."""
@@ -15,7 +17,6 @@ class OffboardControl(Node):
         # Configure QoS profile for publishing and subscribing
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
@@ -23,22 +24,25 @@ class OffboardControl(Node):
         # Create publishers
         self.offboard_control_mode_publisher = self.create_publisher(
             OffboardControlMode, '/fmu/in/offboard_control_mode', qos_profile)
-        self.trajectory_setpoint_publisher = self.create_publisher(
-            TrajectorySetpoint, '/fmu/in/trajectory_setpoint', qos_profile)
         self.vehicle_command_publisher = self.create_publisher(
             VehicleCommand, '/fmu/in/vehicle_command', qos_profile)
+        self.attitude_setpoint_publisher = self.create_publisher(
+            VehicleAttitudeSetpoint, '/fmu/in/vehicle_attitude_setpoint', qos_profile)
 
         # Create subscribers
         self.vehicle_local_position_subscriber = self.create_subscription(
             VehicleLocalPosition, '/fmu/out/vehicle_local_position', self.vehicle_local_position_callback, qos_profile)
         self.vehicle_status_subscriber = self.create_subscription(
             VehicleStatus, '/fmu/out/vehicle_status', self.vehicle_status_callback, qos_profile)
+        self.joy_subscriber = self.create_subscription(
+            Joy, '/joy', self.joy_callback, 10)  # Using default QoS profile for Joy
 
         # Initialize variables
         self.offboard_setpoint_counter = 0
         self.vehicle_local_position = VehicleLocalPosition()
         self.vehicle_status = VehicleStatus()
-        self.takeoff_height = -5.0
+        self.joy_axes = [0.0, 0.0, 0.0, 0.0]  # Initialize joystick axes
+        self.joy_buttons = [0] * 12  # Initialize joystick buttons, assuming 12 buttons
 
         # Create a timer to publish control commands
         self.timer = self.create_timer(0.1, self.timer_callback)
@@ -50,6 +54,11 @@ class OffboardControl(Node):
     def vehicle_status_callback(self, vehicle_status):
         """Callback function for vehicle_status topic subscriber."""
         self.vehicle_status = vehicle_status
+
+    def joy_callback(self, joy_msg):
+        """Callback function for joy topic subscriber."""
+        self.joy_axes = joy_msg.axes
+        self.joy_buttons = joy_msg.buttons
 
     def arm(self):
         """Send an arm command to the vehicle."""
@@ -69,30 +78,47 @@ class OffboardControl(Node):
             VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
         self.get_logger().info("Switching to offboard mode")
 
-    def land(self):
-        """Switch to land mode."""
-        self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
-        self.get_logger().info("Switching to land mode")
-
     def publish_offboard_control_heartbeat_signal(self):
         """Publish the offboard control mode."""
         msg = OffboardControlMode()
-        msg.position = True
+        msg.position = False
         msg.velocity = False
         msg.acceleration = False
-        msg.attitude = False
+        msg.attitude = True
         msg.body_rate = False
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         self.offboard_control_mode_publisher.publish(msg)
 
-    def publish_position_setpoint(self, x: float, y: float, z: float):
-        """Publish the trajectory setpoint."""
-        msg = TrajectorySetpoint()
-        msg.position = [x, y, z]
-        msg.yaw = 1.57079  # (90 degree)
+    def euler_to_quaternion(self, roll: float, pitch: float, yaw: float):
+        """Convert Euler angles to quaternion."""
+        cy = math.cos(yaw * 0.5)
+        sy = math.sin(yaw * 0.5)
+        cp = math.cos(pitch * 0.5)
+        sp = math.sin(pitch * 0.5)
+        cr = math.cos(roll * 0.5)
+        sr = math.sin(roll * 0.5)
+
+        q = [0.0, 0.0, 0.0, 0.0]
+        q[0] = cr * cp * cy + sr * sp * sy
+        q[1] = sr * cp * cy - cr * sp * sy
+        q[2] = cr * sp * cy + sr * cp * sy
+        q[3] = cr * cp * sy - sr * sp * cy
+        return q
+
+    def publish_attitude_setpoint(self, roll: float, pitch: float, yaw: float, thrust: float):
+        """Publish the attitude setpoint."""
+        msg = VehicleAttitudeSetpoint()
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
-        self.trajectory_setpoint_publisher.publish(msg)
-        self.get_logger().info(f"Publishing position setpoints {[x, y, z]}")
+        msg.roll_body = roll
+        msg.pitch_body = pitch
+        msg.yaw_body = yaw
+        msg.yaw_sp_move_rate = 0.0
+        msg.q_d = np.array(self.euler_to_quaternion(roll, pitch, yaw), dtype=np.float32)
+        msg.thrust_body = np.array([0.0, 0.0, -thrust], dtype=np.float32)
+        msg.reset_integral = False
+        msg.fw_control_yaw_wheel = False
+        self.attitude_setpoint_publisher.publish(msg)
+        self.get_logger().info(f"Publishing attitude setpoint: roll={roll}, pitch={pitch}, yaw={yaw}, thrust={thrust}")
 
     def publish_vehicle_command(self, command, **params) -> None:
         """Publish a vehicle command."""
@@ -119,18 +145,27 @@ class OffboardControl(Node):
 
         if self.offboard_setpoint_counter == 10:
             self.engage_offboard_mode()
-            self.arm()
 
-        if self.vehicle_local_position.z > self.takeoff_height and self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD:
-            self.publish_position_setpoint(0.0, 0.0, self.takeoff_height)
+        # Arm/disarm based on button 0 state
+        if self.joy_axes[6] == -1:
+            if not self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED:
+                self.arm()
+        else:
+            if self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED:
+                self.disarm()
 
-        elif self.vehicle_local_position.z <= self.takeoff_height:
-            self.land()
-            exit(0)
+        if self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD:
+            # Get joystick inputs
+            thrust = - (self.joy_axes[0] - 1) / 2  # Assuming axis 0 for thrust and normalizing to [0, 1]
+            roll = - self.joy_axes[1]  # Assuming axis 1 for roll
+            pitch = - self.joy_axes[2]  # Assuming axis 2 for pitch
+            yaw = - self.joy_axes[3]  # Assuming axis 3 for yaw
+
+            # Send attitude setpoint based on joystick input
+            self.publish_attitude_setpoint(roll, pitch, yaw, thrust)
 
         if self.offboard_setpoint_counter < 11:
             self.offboard_setpoint_counter += 1
-
 
 def main(args=None) -> None:
     print('Starting offboard control node...')
@@ -139,7 +174,6 @@ def main(args=None) -> None:
     rclpy.spin(offboard_control)
     offboard_control.destroy_node()
     rclpy.shutdown()
-
 
 if __name__ == '__main__':
     try:
