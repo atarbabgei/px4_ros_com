@@ -43,6 +43,7 @@ class OffboardControl(Node):
         self.vehicle_status = VehicleStatus()
         self.joy_axes = [0.0, 0.0, 0.0, 0.0]  # Initialize joystick axes
         self.joy_buttons = [0] * 12  # Initialize joystick buttons, assuming 12 buttons
+        self.current_yaw = 0.0  # Initialize the current yaw angle
 
         # Create a timer to publish control commands
         self.timer = self.create_timer(0.1, self.timer_callback)
@@ -50,6 +51,7 @@ class OffboardControl(Node):
     def vehicle_local_position_callback(self, vehicle_local_position):
         """Callback function for vehicle_local_position topic subscriber."""
         self.vehicle_local_position = vehicle_local_position
+        self.current_yaw = vehicle_local_position.heading
 
     def vehicle_status_callback(self, vehicle_status):
         """Callback function for vehicle_status topic subscriber."""
@@ -158,11 +160,14 @@ class OffboardControl(Node):
             # Get joystick inputs
             thrust = - (self.joy_axes[0] - 1) / 2  # Assuming axis 0 for thrust and normalizing to [0, 1]
             roll = - self.joy_axes[1]  # Assuming axis 1 for roll
-            pitch = - self.joy_axes[2]  # Assuming axis 2 for pitch
-            yaw = - self.joy_axes[3]  # Assuming axis 3 for yaw
+            pitch = self.joy_axes[2]  # Assuming axis 2 for pitch
+            yaw_rate = - self.joy_axes[3]  # Assuming axis 3 for yaw rate
+
+            # Update the current yaw angle based on yaw rate
+            self.current_yaw += yaw_rate 
 
             # Send attitude setpoint based on joystick input
-            self.publish_attitude_setpoint(roll, pitch, yaw, thrust)
+            self.publish_attitude_setpoint(roll, pitch, self.current_yaw, thrust)
 
         if self.offboard_setpoint_counter < 11:
             self.offboard_setpoint_counter += 1
